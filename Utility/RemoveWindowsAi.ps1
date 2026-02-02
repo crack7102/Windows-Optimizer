@@ -14,17 +14,46 @@ param(
     [array]$Options,
     [switch]$AllOptions,
     [switch]$revertMode,
-    [switch]$backupMode
+    [switch]$backupMode,
+    [ValidateSet('photoviewer', 'mspaint', 'snippingtool', 'notepad', 'photoslegacy')]
+    [array]$InstallClassicApps
 )
 
 if ($nonInteractive) {
-    if (!($AllOptions) -and (!$Options -or $Options.Count -eq 0)) {
+    if (!($AllOptions) -and (!$Options -or $Options.Count -eq 0) -and !($InstallClassicApps)) {
         throw 'Non-Interactive mode was supplied without any options... Please use -Options or -AllOptions when using Non-Interactive Mode'
         exit
     }
 }
 
 
+#get powershell version to ensure run-trusted doesnt enter an infinite loop
+$version = $PSVersionTable.PSVersion
+if ($version -like '7*') {
+    $Global:psversion = 7
+}
+else {
+    $Global:psversion = 5
+}
+
+if ($psversion -ge 7) {
+    Write-Host 'ERROR: This script requires Windows PowerShell 5.1 (powershell.exe).' -ForegroundColor Red
+    Write-Host "You are currently running PowerShell version $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)." -ForegroundColor Red
+    Write-Host 'PowerShell 7+ (pwsh.exe) is not supported. Please run the script using the classic Windows PowerShell 5.1.' -ForegroundColor Red
+    if (-not $nonInteractive) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            [System.Windows.Forms.MessageBox]::Show(
+                "This script must be run in Windows PowerShell 5.1.`n`nCurrent version: $($PSVersionTable.PSVersion)`n`nPlease use powershell.exe instead of pwsh.exe.",
+                'PowerShell Version Error',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+        catch { }
+    }
+    exit 1
+}
 
 If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]'Administrator')) {
     #leave out the trailing " to add supplied params first 
@@ -57,6 +86,10 @@ If (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
             else {
                 $arglist = $arglist + " -Options $Options"
             }
+        }
+
+        if ($InstallClassicApps -and $InstallClassicApps.Count -ne 0) {
+            $arglist = $arglist + " -InstallClassicApps $InstallClassicApps"
         }
     }
 
@@ -183,12 +216,7 @@ function Run-Trusted([String]$command, $psversion) {
     # changed start-process to wshell run to avoid the first powershell instance window from flashing
 
 
-    if ($psversion -eq 7) {
-        $psexe = 'pwsh.exe'
-    }
-    else {
-        $psexe = 'PowerShell.exe'
-    }
+    $psexe = 'PowerShell.exe'
 
     #convert command to base64 to avoid errors with spaces
     $bytes = [System.Text.Encoding]::Unicode.GetBytes($command)
@@ -258,15 +286,6 @@ function Write-Status {
 
 Write-Host '~ ~ ~ Remove Windows AI by @zoicware ~ ~ ~' -ForegroundColor DarkCyan
 
-#get powershell version to ensure run-trusted doesnt enter an infinite loop
-$version = $PSVersionTable.PSVersion
-if ($version -like '7*') {
-    $Global:psversion = 7
-}
-else {
-    $Global:psversion = 5
-}
-
 if ($EnableLogging) {
     $date = (Get-Date).ToString('MM-dd-yyyy-HH:mm') -replace ':'
     $Global:logPath = "$env:USERPROFILE\RemoveWindowsAI$date.log"
@@ -297,6 +316,8 @@ else {
     $Global:backup = 0
 }
 
+$Global:tempDir = ([System.IO.Path]::GetTempPath())
+
 #=====================================================================================
 
 function Add-LogInfo {
@@ -312,6 +333,65 @@ function Add-LogInfo {
 "@
 
     Add-Content $logPath -Value $content | Out-Null
+}
+
+
+function Create-RestorePoint {
+    param(
+        [switch]$nonInteractive
+    )
+
+    #check vss service first
+    $vssService = Get-Service -Name 'VSS' -ErrorAction SilentlyContinue
+    if ($vssService -and $vssService.StartType -eq 'Disabled') {
+        try {
+            Write-Status -msg 'Enabling VSS Service...'
+            Set-Service -Name 'VSS' -StartupType Manual -ErrorAction Stop
+            Start-Service -Name 'VSS' -ErrorAction Stop
+        }
+        catch {
+            Write-Status -msg 'Unable to Start VSS Service... Can not create restore point!' -errorOutput
+            return
+        }
+        
+    }
+    #enable system protection to allow restore points
+    $restoreEnabled = Get-ComputerRestorePoint -ErrorAction SilentlyContinue
+    if (!$restoreEnabled) {
+        Write-Status -msg 'Enabling Restore Points on System...'
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" 
+    }
+
+    
+    if ($nonInteractive) {
+        #allow restore point to be created even if one was just made
+        $restoreFreqPath = 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+        $restoreFreqKey = 'SystemRestorePointCreationFrequency'
+        $currentValue = (Get-ItemProperty -Path $restoreFreqPath -Name $restoreFreqKey -ErrorAction SilentlyContinue).$restoreFreqKey
+        if ($currentValue -ne 0) {
+            Set-ItemProperty -Path $restoreFreqPath -Name $restoreFreqKey -Value 0 -Force
+        }
+
+        $restorePointName = "RemoveWindowsAI-$(Get-Date -Format 'yyyy-MM-dd')"
+        Write-Status -msg "Creating Restore Point: [$restorePointName]"
+        Write-Status -msg 'This may take a moment...please wait'
+        Checkpoint-Computer -Description $restorePointName -RestorePointType 'MODIFY_SETTINGS' 
+    }
+    else {
+        Write-Status -msg 'Opening Restore Point Dialog...'
+        try {
+            $proc = Start-Process 'SystemPropertiesProtection.exe' -ErrorAction Stop -PassThru
+        }
+        catch {
+            $proc = Start-Process 'C:\Windows\System32\control.exe' -ArgumentList 'sysdm.cpl ,4' -PassThru
+        }
+        #click configure on the window
+        Start-Sleep 1
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.SendKeys]::SendWait('%c') 
+        Wait-Process -Id $proc.Id
+    }
+
 }
 
 function Disable-Registry-Keys {
@@ -453,6 +533,31 @@ function Disable-Registry-Keys {
     #disable office ai with group policy
     Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\training\general' /v 'disabletraining' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
     Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\training\specific\adaptivefloatie' /v 'disabletrainingofadaptivefloatie' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    #disable connected experiences in office should prevent copilot from working 
+    Reg.exe add 'HKCU\Software\Policies\Microsoft\office\16.0\common\privacy' /v 'controllerconnectedservicesenabled' /t REG_DWORD /d @('2', '1')[$revert] /f *>$null
+    Reg.exe add 'HKCU\Software\Policies\Microsoft\office\16.0\common\privacy' /v 'usercontentdisabled' /t REG_DWORD /d @('2', '1')[$revert] /f *>$null
+    #disable copilot buttons in word
+    #Reg.exe add 'HKCU\Software\Policies\Microsoft\office\16.0\word\disabledcmdbaritemslist' /v 'TCID1' /t REG_SZ /d '47229' /f
+    #Reg.exe add 'HKCU\Software\Policies\Microsoft\office\16.0\word\disabledcmdbaritemslist' /v 'TCID2' /t REG_SZ /d '43223' /f
+    #Reg.exe add 'HKCU\Software\Policies\Microsoft\office\16.0\word\disabledcmdbaritemslist' /v 'TCID3' /t REG_SZ /d '34872' /f
+    #Reg.exe add 'HKCU\Software\Policies\Microsoft\office\16.0\word\disabledcmdbaritemslist' /v 'TCID4' /t REG_SZ /d '42552' /f
+    #disable copilot in word
+    Reg.exe add 'HKCU\Software\Microsoft\Office\16.0\Word\Options' /v 'EnableCopilot' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
+    #disable copilot in excel
+    Reg.exe add 'HKCU\Software\Microsoft\Office\16.0\Excel\Options' /v 'EnableCopilot' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
+    #disable copilot in onenote
+    Reg.exe add 'HKCU\Software\Microsoft\Office\16.0\OneNote\Options\Copilot' /v 'CopilotEnabled' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
+    Reg.exe add 'HKCU\Software\Microsoft\Office\16.0\OneNote\Options\Copilot' /v 'CopilotNotebooksEnabled' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
+    Reg.exe add 'HKCU\Software\Microsoft\Office\16.0\OneNote\Options\Copilot' /v 'CopilotSkittleEnabled' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
+    #disable office ai content safety
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\general' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\alternativetext' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\imagequestionandanswering' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\promptassistance' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\rewrite' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\summarization' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\summarizationwithreferences' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SOFTWARE\Policies\Microsoft\office\16.0\common\ai\contentsafety\specific\texttotable' /v 'disablecontentsafety' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
     #disable additional keys
     Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings' /v 'AutoOpenCopilotLargeScreens' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
     Reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\generativeAI' /v 'Value' /t REG_SZ /d @('Deny', 'Allow')[$revert] /f *>$null
@@ -497,7 +602,9 @@ function Disable-Registry-Keys {
     #Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\FeatureManagement\Overrides\8\2931206798' /v 'EnabledState' /t REG_DWORD /d '2' /f
     #Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\FeatureManagement\Overrides\8\3098978958' /v 'EnabledState' /t REG_DWORD /d '2' /f
     #Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\FeatureManagement\Overrides\8\3233196686' /v 'EnabledState' /t REG_DWORD /d '2' /f
-    
+    #disable core ai / click to do with feature management 
+    Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\FeatureManagement\Overrides\8\2283032206' /v 'EnabledState' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
+    Reg.exe add 'HKLM\SYSTEM\ControlSet001\Control\FeatureManagement\Overrides\8\502943886' /v 'EnabledState' /t REG_DWORD /d @('1', '0')[$revert] /f *>$null
     #disable ask copilot (taskbar search)
     Reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v 'TaskbarCompanion' /t REG_DWORD /d @('0', '1')[$revert] /f *>$null
     Reg.exe add 'HKCU\Software\Microsoft\Windows\Shell\BrandedKey' /v 'BrandedKeyChoiceType' /t REG_SZ /d @('Search', 'App')[$revert] /f *>$null
@@ -692,8 +799,8 @@ function Disable-Registry-Keys {
     else {
         if ($backup) {
             #backup .copilot file extension
-            Reg.exe export 'HKEY_CLASSES_ROOT\.copilot' "$backupPath\HKCR_Copilot.reg" *>$null
-            Reg.exe export 'HKEY_CURRENT_USER\Software\Classes\.copilot' "$backupPath\HKCU_Copilot.reg" *>$null
+            Reg.exe export 'HKEY_CLASSES_ROOT\.copilot' "$backupPath\HKCR_Copilot.reg" /y *>$null
+            Reg.exe export 'HKEY_CURRENT_USER\Software\Classes\.copilot' "$backupPath\HKCU_Copilot.reg" /y *>$null
         }
         Write-Status -msg 'Removing .copilot File Extension...' 
         Reg.exe delete 'HKCU\Software\Classes\.copilot' /f *>$null
@@ -812,11 +919,12 @@ Windows Registry Editor Version 5.00
 '@
         }
        
-        New-Item "$env:TEMP\DisableAIPhotos.reg" -Value $regContent -Force | Out-Null
-        regedit.exe /s "$env:TEMP\DisableAIPhotos.reg"
+        
+        New-Item "$($tempDir)DisableAIPhotos.reg" -Value $regContent -Force | Out-Null
+        regedit.exe /s "$($tempDir)DisableAIPhotos.reg"
         Start-Sleep 1
         reg unload HKU\TEMP >$null
-        Remove-Item "$env:TEMP\DisableAIPhotos.reg" -Force -ErrorAction SilentlyContinue
+        Remove-Item "$($tempDir)DisableAIPhotos.reg" -Force -ErrorAction SilentlyContinue
     }
 
    
@@ -831,6 +939,7 @@ Windows Registry Editor Version 5.00
 
 
 function Install-NOAIPackage {
+    
     if (!$revert) {
         $package = Get-WindowsPackage -Online | Where-Object { $_.PackageName -like '*zoicware*' }
         if (!$package) {
@@ -861,7 +970,7 @@ function Install-NOAIPackage {
                 Write-Status -msg 'Downloading RemoveWindowsAI Package From Github...'
                 $ProgressPreference = 'SilentlyContinue'
                 try {
-                    Invoke-WebRequest -Uri "https://github.com/zoicware/RemoveWindowsAI/raw/refs/heads/main/RemoveWindowsAIPackage/$arch/ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -OutFile "$env:TEMP\ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -UseBasicParsing -ErrorAction Stop
+                    Invoke-WebRequest -Uri "https://github.com/zoicware/RemoveWindowsAI/raw/refs/heads/main/RemoveWindowsAIPackage/$arch/ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -OutFile "$($tempDir)ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -UseBasicParsing -ErrorAction Stop
                 }
                 catch {
                     Write-Status -msg "Unable to Download Package at: https://github.com/zoicware/RemoveWindowsAI/raw/refs/heads/main/RemoveWindowsAIPackage/$arch/ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -errorOutput
@@ -870,10 +979,10 @@ function Install-NOAIPackage {
 
                 Write-Status -msg 'Installing RemoveWindowsAI Package...'
                 try {
-                    Add-WindowsPackage -Online -PackagePath "$env:TEMP\ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -NoRestart -IgnoreCheck -ErrorAction Stop >$null
+                    Add-WindowsPackage -Online -PackagePath "$($tempDir)ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" -NoRestart -IgnoreCheck -ErrorAction Stop >$null
                 }
                 catch {
-                    dism.exe /Online /Add-Package /PackagePath:"$env:TEMP\ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" /NoRestart /IgnoreCheck >$null
+                    dism.exe /Online /Add-Package /PackagePath:"$($tempDir)ZoicwareRemoveWindowsAI-$($arch)1.0.0.0.cab" /NoRestart /IgnoreCheck >$null
                 }
             }
         }
@@ -990,183 +1099,185 @@ function Disable-Copilot-Policies {
     
 }
 
+#function from: https://github.com/Andrew-J-Larson/OS-Scripts/blob/main/Windows/Wrapper-Functions/Download-AppxPackage-Function.ps1
+function Download-AppxPackage {
+    param(
+        # there has to be an alternative, as sometimes the API fails on PackageFamilyName
+        [string]$PackageFamilyName,
+        [string]$ProductId,
+        [string]$outputDir
+    )
+    if (-Not ($PackageFamilyName -Or $ProductId)) {
+        # can't do anything without at least one
+        Write-Error 'Missing either PackageFamilyName or ProductId.'
+        return $null
+    }
+      
+    try {
+        $UserAgent = [Microsoft.PowerShell.Commands.PSUserAgent]::Chrome # needed as sometimes the API will block things when it knows requests are coming from PowerShell
+    }
+    catch {
+        #ignore error
+    }
+      
+    $DownloadedFiles = @()
+    $errored = $false
+    $allFilesDownloaded = $true
+      
+    $apiUrl = 'https://store.rg-adguard.net/api/GetFiles'
+    $versionRing = 'Retail'
+      
+    $architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
+        'x86' { 'x86' }
+        { @('x64', 'amd64') -contains $_ } { 'x64' }
+        'arm' { 'arm' }
+        'arm64' { 'arm64' }
+        default { 'neutral' } # should never get here
+    }
+      
+    if (Test-Path $outputDir -PathType Container) {
+        New-Item -Path "$outputDir\$PackageFamilyName" -ItemType Directory -Force | Out-Null
+        $downloadFolder = "$outputDir\$PackageFamilyName"
+    }
+    else {
+        
+        $downloadFolder = Join-Path $tempDir $PackageFamilyName
+        if (!(Test-Path $downloadFolder -PathType Container)) {
+            New-Item $downloadFolder -ItemType Directory -Force | Out-Null
+        }
+    }
+        
+    $body = @{
+        type = if ($ProductId) { 'ProductId' } else { 'PackageFamilyName' }
+        url  = if ($ProductId) { $ProductId } else { $PackageFamilyName }
+        ring = $versionRing
+        lang = 'en-US'
+    }
+      
+    # required due to the api being protected behind Cloudflare now
+    if (-Not $apiWebSession) {
+        $global:apiWebSession = $null
+        $apiHostname = (($apiUrl.split('/'))[0..2]) -Join '/'
+        Invoke-WebRequest -Uri $apiHostname -UserAgent $UserAgent -SessionVariable $apiWebSession -UseBasicParsing
+    }
+      
+    $raw = $null
+    try {
+        $raw = Invoke-RestMethod -Method Post -Uri $apiUrl -ContentType 'application/x-www-form-urlencoded' -Body $body -UserAgent $UserAgent -WebSession $apiWebSession
+    }
+    catch {
+        $errorMsg = 'An error occurred: ' + $_
+        Write-Host $errorMsg
+        $errored = $true
+        return $false
+    }
+      
+    # hashtable of packages by $name
+    #  > values = hashtables of packages by $version
+    #    > values = arrays of packages as objects (containing: url, filename, name, version, arch, publisherId, type)
+    [Collections.Generic.Dictionary[string, Collections.Generic.Dictionary[string, array]]] $packageList = @{}
+    # populate $packageList
+    $patternUrlAndText = '<tr style.*<a href=\"(?<url>.*)"\s.*>(?<text>.*\.(app|msi)x.*)<\/a>'
+    $raw | Select-String $patternUrlAndText -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object {
+        $url = ($_.Groups['url']).Value
+        $text = ($_.Groups['text']).Value
+        $textSplitUnderscore = $text.split('_')
+        $name = $textSplitUnderscore.split('_')[0]
+        $version = $textSplitUnderscore.split('_')[1]
+        $arch = ($textSplitUnderscore.split('_')[2]).ToLower()
+        $publisherId = ($textSplitUnderscore.split('_')[4]).split('.')[0]
+        $textSplitPeriod = $text.split('.')
+        $type = ($textSplitPeriod[$textSplitPeriod.length - 1]).ToLower()
+      
+        # create $name hash key hashtable, if it doesn't already exist
+        if (!($packageList.keys -match ('^' + [Regex]::escape($name) + '$'))) {
+            $packageList["$name"] = @{}
+        }
+        # create $version hash key array, if it doesn't already exist
+        if (!(($packageList["$name"]).keys -match ('^' + [Regex]::escape($version) + '$'))) {
+            ($packageList["$name"])["$version"] = @()
+        }
+       
+        # add package to the array in the hashtable
+        ($packageList["$name"])["$version"] += @{
+            url         = $url
+            filename    = $text
+            name        = $name
+            version     = $version
+            arch        = $arch
+            publisherId = $publisherId
+            type        = $type
+        }
+    }
+      
+    # an array of packages as objects, meant to only contain one of each $name
+    $latestPackages = @()
+    # grabs the most updated package for $name and puts it into $latestPackages
+    $packageList.GetEnumerator() | ForEach-Object { ($_.value).GetEnumerator() | Select-Object -Last 1 } | ForEach-Object {
+        $packagesByType = $_.value
+        $msixbundle = ($packagesByType | Where-Object { $_.type -match '^msixbundle$' })
+        $appxbundle = ($packagesByType | Where-Object { $_.type -match '^appxbundle$' })
+        $msix = ($packagesByType | Where-Object { ($_.type -match '^msix$') -And ($_.arch -match ('^' + [Regex]::Escape($architecture) + '$')) })
+        $appx = ($packagesByType | Where-Object { ($_.type -match '^appx$') -And ($_.arch -match ('^' + [Regex]::Escape($architecture) + '$')) })
+        if ($msixbundle) { $latestPackages += $msixbundle }
+        elseif ($appxbundle) { $latestPackages += $appxbundle }
+        elseif ($msix) { $latestPackages += $msix }
+        elseif ($appx) { $latestPackages += $appx }
+    }
+      
+    # download packages
+    $latestPackages | ForEach-Object {
+        $url = $_.url
+        $filename = $_.filename
+        # TODO: may need to include detection in the future of expired package download URLs..... in the case that downloads take over 10 minutes to complete
+      
+        $downloadFile = Join-Path $downloadFolder $filename
+      
+        # If file already exists, ask to replace it
+        if (Test-Path $downloadFile) {
+            Write-Host "`"${filename}`" already exists at `"${downloadFile}`"."
+            $confirmation = ''
+            while (!(($confirmation -eq 'Y') -Or ($confirmation -eq 'N'))) {
+                $confirmation = Read-Host "`nWould you like to re-download and overwrite the file at `"${downloadFile}`" (Y/N)?"
+                $confirmation = $confirmation.ToUpper()
+            }
+            if ($confirmation -eq 'Y') {
+                Remove-Item -Path $downloadFile -Force
+            }
+            else {
+                $DownloadedFiles += $downloadFile
+            }
+        }
+      
+        if (!(Test-Path $downloadFile)) {
+            # Write-Host "Attempting download of `"${filename}`" to `"${downloadFile}`" . . ."
+            $fileDownloaded = $null
+            $PreviousProgressPreference = $ProgressPreference
+            $ProgressPreference = 'SilentlyContinue' # avoids slow download when using Invoke-WebRequest
+            try {
+                Invoke-WebRequest -Uri $url -OutFile $downloadFile
+                $fileDownloaded = $?
+            }
+            catch {
+                $ProgressPreference = $PreviousProgressPreference # return ProgressPreference back to normal
+                $errorMsg = 'An error occurred: ' + $_
+                Write-Host $errorMsg
+                $errored = $true
+                break $false
+            }
+            $ProgressPreference = $PreviousProgressPreference # return ProgressPreference back to normal
+            if ($fileDownloaded) { $DownloadedFiles += $downloadFile }
+            else { $allFilesDownloaded = $false }
+        }
+    }
+      
+    if ($errored) { Write-Host 'Completed with some errors.' }
+    if (-Not $allFilesDownloaded) { Write-Host 'Warning: Not all packages could be downloaded.' }
+    return $DownloadedFiles
+}
+
 
 function Remove-AI-Appx-Packages {
-    #function from: https://github.com/Andrew-J-Larson/OS-Scripts/blob/main/Windows/Wrapper-Functions/Download-AppxPackage-Function.ps1
-    function Download-AppxPackage {
-        param(
-            # there has to be an alternative, as sometimes the API fails on PackageFamilyName
-            [string]$PackageFamilyName,
-            [string]$ProductId,
-            [string]$outputDir
-        )
-        if (-Not ($PackageFamilyName -Or $ProductId)) {
-            # can't do anything without at least one
-            Write-Error 'Missing either PackageFamilyName or ProductId.'
-            return $null
-        }
-      
-        try {
-            $UserAgent = [Microsoft.PowerShell.Commands.PSUserAgent]::Chrome # needed as sometimes the API will block things when it knows requests are coming from PowerShell
-        }
-        catch {
-            #ignore error
-        }
-      
-        $DownloadedFiles = @()
-        $errored = $false
-        $allFilesDownloaded = $true
-      
-        $apiUrl = 'https://store.rg-adguard.net/api/GetFiles'
-        $versionRing = 'Retail'
-      
-        $architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
-            'x86' { 'x86' }
-            { @('x64', 'amd64') -contains $_ } { 'x64' }
-            'arm' { 'arm' }
-            'arm64' { 'arm64' }
-            default { 'neutral' } # should never get here
-        }
-      
-        if (Test-Path $outputDir -PathType Container) {
-            New-Item -Path "$outputDir\$PackageFamilyName" -ItemType Directory -Force | Out-Null
-            $downloadFolder = "$outputDir\$PackageFamilyName"
-        }
-        else {
-            $downloadFolder = Join-Path $env:TEMP $PackageFamilyName
-            if (!(Test-Path $downloadFolder -PathType Container)) {
-                New-Item $downloadFolder -ItemType Directory -Force | Out-Null
-            }
-        }
-        
-        $body = @{
-            type = if ($ProductId) { 'ProductId' } else { 'PackageFamilyName' }
-            url  = if ($ProductId) { $ProductId } else { $PackageFamilyName }
-            ring = $versionRing
-            lang = 'en-US'
-        }
-      
-        # required due to the api being protected behind Cloudflare now
-        if (-Not $apiWebSession) {
-            $global:apiWebSession = $null
-            $apiHostname = (($apiUrl.split('/'))[0..2]) -Join '/'
-            Invoke-WebRequest -Uri $apiHostname -UserAgent $UserAgent -SessionVariable $apiWebSession -UseBasicParsing
-        }
-      
-        $raw = $null
-        try {
-            $raw = Invoke-RestMethod -Method Post -Uri $apiUrl -ContentType 'application/x-www-form-urlencoded' -Body $body -UserAgent $UserAgent -WebSession $apiWebSession
-        }
-        catch {
-            $errorMsg = 'An error occurred: ' + $_
-            Write-Host $errorMsg
-            $errored = $true
-            return $false
-        }
-      
-        # hashtable of packages by $name
-        #  > values = hashtables of packages by $version
-        #    > values = arrays of packages as objects (containing: url, filename, name, version, arch, publisherId, type)
-        [Collections.Generic.Dictionary[string, Collections.Generic.Dictionary[string, array]]] $packageList = @{}
-        # populate $packageList
-        $patternUrlAndText = '<tr style.*<a href=\"(?<url>.*)"\s.*>(?<text>.*\.(app|msi)x.*)<\/a>'
-        $raw | Select-String $patternUrlAndText -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object {
-            $url = ($_.Groups['url']).Value
-            $text = ($_.Groups['text']).Value
-            $textSplitUnderscore = $text.split('_')
-            $name = $textSplitUnderscore.split('_')[0]
-            $version = $textSplitUnderscore.split('_')[1]
-            $arch = ($textSplitUnderscore.split('_')[2]).ToLower()
-            $publisherId = ($textSplitUnderscore.split('_')[4]).split('.')[0]
-            $textSplitPeriod = $text.split('.')
-            $type = ($textSplitPeriod[$textSplitPeriod.length - 1]).ToLower()
-      
-            # create $name hash key hashtable, if it doesn't already exist
-            if (!($packageList.keys -match ('^' + [Regex]::escape($name) + '$'))) {
-                $packageList["$name"] = @{}
-            }
-            # create $version hash key array, if it doesn't already exist
-            if (!(($packageList["$name"]).keys -match ('^' + [Regex]::escape($version) + '$'))) {
-                ($packageList["$name"])["$version"] = @()
-            }
-       
-            # add package to the array in the hashtable
-            ($packageList["$name"])["$version"] += @{
-                url         = $url
-                filename    = $text
-                name        = $name
-                version     = $version
-                arch        = $arch
-                publisherId = $publisherId
-                type        = $type
-            }
-        }
-      
-        # an array of packages as objects, meant to only contain one of each $name
-        $latestPackages = @()
-        # grabs the most updated package for $name and puts it into $latestPackages
-        $packageList.GetEnumerator() | ForEach-Object { ($_.value).GetEnumerator() | Select-Object -Last 1 } | ForEach-Object {
-            $packagesByType = $_.value
-            $msixbundle = ($packagesByType | Where-Object { $_.type -match '^msixbundle$' })
-            $appxbundle = ($packagesByType | Where-Object { $_.type -match '^appxbundle$' })
-            $msix = ($packagesByType | Where-Object { ($_.type -match '^msix$') -And ($_.arch -match ('^' + [Regex]::Escape($architecture) + '$')) })
-            $appx = ($packagesByType | Where-Object { ($_.type -match '^appx$') -And ($_.arch -match ('^' + [Regex]::Escape($architecture) + '$')) })
-            if ($msixbundle) { $latestPackages += $msixbundle }
-            elseif ($appxbundle) { $latestPackages += $appxbundle }
-            elseif ($msix) { $latestPackages += $msix }
-            elseif ($appx) { $latestPackages += $appx }
-        }
-      
-        # download packages
-        $latestPackages | ForEach-Object {
-            $url = $_.url
-            $filename = $_.filename
-            # TODO: may need to include detection in the future of expired package download URLs..... in the case that downloads take over 10 minutes to complete
-      
-            $downloadFile = Join-Path $downloadFolder $filename
-      
-            # If file already exists, ask to replace it
-            if (Test-Path $downloadFile) {
-                Write-Host "`"${filename}`" already exists at `"${downloadFile}`"."
-                $confirmation = ''
-                while (!(($confirmation -eq 'Y') -Or ($confirmation -eq 'N'))) {
-                    $confirmation = Read-Host "`nWould you like to re-download and overwrite the file at `"${downloadFile}`" (Y/N)?"
-                    $confirmation = $confirmation.ToUpper()
-                }
-                if ($confirmation -eq 'Y') {
-                    Remove-Item -Path $downloadFile -Force
-                }
-                else {
-                    $DownloadedFiles += $downloadFile
-                }
-            }
-      
-            if (!(Test-Path $downloadFile)) {
-                # Write-Host "Attempting download of `"${filename}`" to `"${downloadFile}`" . . ."
-                $fileDownloaded = $null
-                $PreviousProgressPreference = $ProgressPreference
-                $ProgressPreference = 'SilentlyContinue' # avoids slow download when using Invoke-WebRequest
-                try {
-                    Invoke-WebRequest -Uri $url -OutFile $downloadFile
-                    $fileDownloaded = $?
-                }
-                catch {
-                    $ProgressPreference = $PreviousProgressPreference # return ProgressPreference back to normal
-                    $errorMsg = 'An error occurred: ' + $_
-                    Write-Host $errorMsg
-                    $errored = $true
-                    break $false
-                }
-                $ProgressPreference = $PreviousProgressPreference # return ProgressPreference back to normal
-                if ($fileDownloaded) { $DownloadedFiles += $downloadFile }
-                else { $allFilesDownloaded = $false }
-            }
-        }
-      
-        if ($errored) { Write-Host 'Completed with some errors.' }
-        if (-Not $allFilesDownloaded) { Write-Host 'Warning: Not all packages could be downloaded.' }
-        return $DownloadedFiles
-    }
 
     if ($revert) {
 
@@ -1197,8 +1308,8 @@ function Remove-AI-Appx-Packages {
         #to make this part faster make a txt file in temp with chunck of removal 
         #code and then just run that from run 
         #trusted function due to the design of having it hidden from the user
-
-        $packageRemovalPath = "$env:TEMP\aiPackageRemoval.ps1"
+        
+        $packageRemovalPath = "$($tempDir)aiPackageRemoval.ps1"
         if (!(test-path $packageRemovalPath)) {
             New-Item $packageRemovalPath -Force | Out-Null
         }
@@ -1420,7 +1531,7 @@ foreach ($choice in $aipackages) {
 
 
         Write-Status -msg 'Removing AI Appx Packages...'
-        $command = "&$env:TEMP\aiPackageRemoval.ps1"
+        $command = "&`"$($tempDir)aiPackageRemoval.ps1`""
         Run-Trusted -command $command -psversion $psversion
 
         #check packages removal
@@ -1436,7 +1547,7 @@ foreach ($choice in $aipackages) {
                     $Global:logInfo.Result = "Found Packages: $packages"
                     Add-LogInfo -logPath $logPath -info $Global:logInfo
                 }
-                $command = "&$env:TEMP\aiPackageRemoval.ps1"
+                $command = "&`"$($tempDir)aiPackageRemoval.ps1`""
                 Run-Trusted -command $command -psversion $psversion
             }
     
@@ -1610,6 +1721,13 @@ function Remove-AI-Files {
             Write-Status -msg 'Unable to Find Backup Files!' -errorOutput 
         }
        
+        <#
+        if (Test-Path "$env:USERPROFILE\RemoveWindowsAI\Backup\CompStorage"){
+            Get-ChildItem "$env:USERPROFILE\RemoveWindowsAI\Backup\CompStorage" -Filter "*.reg"
+        }else{
+            Write-Status -msg 'Unable to Find Component Storage Backup!' -errorOutput 
+        }
+        #>
     }
     else {
 
@@ -2042,8 +2160,8 @@ function Remove-AI-Files {
             'C:\Windows\WinSxS',
             'C:\Windows\System32\CatRoot'
         )
-
-        New-Item "$env:TEMP\PathsToDelete.txt" -ItemType File -Force | Out-Null
+        
+        New-Item "$($tempDir)PathsToDelete.txt" -ItemType File -Force | Out-Null
         foreach ($keyword in $aiKeyWords) {
             foreach ($location in $regLocations) {
                 Get-ChildItem $location -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "*$keyword*" } | ForEach-Object {
@@ -2069,16 +2187,57 @@ function Remove-AI-Files {
                 $(Test-Path $_.FullName -PathType Container) -eq $true 
             } | ForEach-Object {
                 #add paths to txt to delete with trusted installer
-                Add-Content "$env:TEMP\PathsToDelete.txt" -Value $_.FullName | Out-Null
+                Add-Content "$($tempDir)PathsToDelete.txt" -Value $_.FullName | Out-Null
             } 
         }
         
         
-        $command = "Get-Content `"`$env:TEMP\PathsToDelete.txt`" | ForEach-Object {Remove-Item `$_ -Force -Recurse -EA 0}"
+        $command = "Get-Content `"$($tempDir)PathsToDelete.txt`" | ForEach-Object {Remove-Item `$_ -Force -Recurse -EA 0}"
         Run-Trusted -command $command -psversion $psversion
         Start-Sleep 1
     }
 
+    #TEST:
+    # remove ai components from component storage
+    # this will prevent sfc from trying to repair files removed 
+    # but seems to prevent windows update from working
+    <#
+    $compPath = "$env:systemroot\System32\config\COMPONENTS"
+
+    reg.exe query 'HKLM\COMPONENTS' /ve *>$null
+    if ($LASTEXITCODE -ne 0) {
+        reg.exe load 'HKLM\COMPONENTS' $compPath >$null
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Status -msg "Unable to Load $compPath" -errorOutput
+    }
+    else {
+        $paths = Get-ChildItem 'registry::HKLM\COMPONENTS\DerivedData\Components' | Where-Object { $_.PSChildName -like '*copilot*' -or
+            $_.PSChildName -like '*userexperience-aix*' -or
+            $_.PSChildName -like '*userexperience-recall*' -or
+            $_.PSChildName -like '*userexperience-coreai*' } 
+
+        if ($paths) {
+            Write-Status -msg 'Removing AI Components Found in Component Storage...'
+            #backup by default for now
+            $backupPath = "$env:USERPROFILE\RemoveWindowsAI\Backup\CompStorage"
+            if (!(Test-Path $backupPath)) {
+                New-Item $backupPath -ItemType Directory | Out-Null
+            }
+
+            foreach ($path in $paths) {
+                reg.exe export $path.Name "$backupPath\$($path.PSChildName).reg" /y >$null
+                reg.exe delete $path.Name /f
+            }
+            
+        }
+        else {
+            Write-Status -msg 'No Ai Components Found in Component Storage'
+        }
+
+    }
+    #>
 }
 
 
@@ -2174,11 +2333,12 @@ Get-ScheduledTask -TaskName "*Office Actions Server*" -ErrorAction SilentlyConti
     }
     Remove-Item 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Office\Office Actions Server' -Recurse -Force -ErrorAction SilentlyContinue
 "@
-        $subScript = "$env:TEMP\RemoveRecallTasks.ps1"
-        New-Item $subScript -Force | Out-Null
-        Set-Content $subScript -Value $code -Force
+        
+        $subScript = "$($tempDir)RemoveRecallTasks.ps1"
+        New-Item "$subScript" -Force | Out-Null
+        Set-Content "$subScript" -Value $code -Force
 
-        $command = "&$subScript"
+        $command = "&`"$subScript`""
         Run-Trusted -command $command -psversion $psversion
         Start-Sleep 1
         
@@ -2193,8 +2353,387 @@ Get-ScheduledTask -TaskName "*Office Actions Server*" -ErrorAction SilentlyConti
     
 }
 
+function install-photoviewer {
+    
+    #restore classic photoviewer
+    $extensions = @('.Bmp', '.Cr2', '.Dib', '.Gif', '.JFIF', '.Jpe', '.Jpeg', '.Jpg', '.Jxr', '.Png', '.Tif', '.Tiff', '.Wdp')
+
+    foreach ($ext in $extensions) {
+        if ($ext -in @('.JFIF', '.Jpeg', '.Gif', '.Png', '.Wdp')) {
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext" /v 'EditFlags' /t REG_DWORD /d 65536 /f >$null
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext" /v 'ImageOptionFlags' /t REG_DWORD /d 1 /f >$null
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext" /v 'FriendlyTypeName' /t REG_EXPAND_SZ /d '@%ProgramFiles%\Windows Photo Viewer\PhotoViewer.dll,-3055' /f >$null
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext\DefaultIcon" /ve /t REG_SZ /d '%SystemRoot%\System32\imageres.dll,-72' /f >$null
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext\shell\open" /v 'MuiVerb' /t REG_EXPAND_SZ /d '@%ProgramFiles%\Windows Photo Viewer\photoviewer.dll,-3043' /f >$null
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext\shell\open\command" /ve /t REG_EXPAND_SZ /d "%SystemRoot%\System32\rundll32.exe \`"%ProgramFiles%\Windows Photo Viewer\PhotoViewer.dll\`", ImageView_Fullscreen %1" /f >$null
+            reg.exe add "HKLM\SOFTWARE\Classes\PhotoViewer.FileAssoc$ext\shell\open\DropTarget" /v 'Clsid' /t REG_SZ /d '{FFE2A43C-56B9-4bf5-9A79-CC6D4285608A}' /f >$null
+        }
+    
+        if ($ext -in @('.Cr2', '.Tif')) {
+            reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Photo Viewer\Capabilities\FileAssociations' /v $ext.ToLower() /t REG_SZ /d 'PhotoViewer.FileAssoc.Tiff' /f >$null
+        }
+        elseif ($ext -in @('.Dib', '.Bmp')) {
+            reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Photo Viewer\Capabilities\FileAssociations' /v $ext.ToLower() /t REG_SZ /d 'PhotoViewer.FileAssoc.Bitmap' /f >$null
+        }
+        elseif ($ext -in @('.Jpg', '.Jpe', '.Jpeg')) {
+            reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Photo Viewer\Capabilities\FileAssociations' /v $ext.ToLower() /t REG_SZ /d 'PhotoViewer.FileAssoc.Jpeg' /f >$null
+        }
+        else {
+            reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows Photo Viewer\Capabilities\FileAssociations' /v $ext.ToLower() /t REG_SZ /d "PhotoViewer.FileAssoc$ext" /f >$null
+        }
+    }
+}
+
+function install-paint {
+    param(
+        [string]$path
+    )
+
+    get-appxpackage '*Microsoft.Paint*' | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+    
+    $command = "
+    copy-item `"$path\paint\mspaint.exe`" -Destination `"$env:systemroot\system32\mspaint.exe`" -Force
+    copy-item `"$path\paint\mspaint.exe.mui`" -Destination `"$env:systemroot\System32\en-US\mspaint.exe.mui`" -Force
+    copy-item `"$path\paint\mspaint.exe.mun`" -Destination `"$env:systemroot\SystemResources`" -Force
+"
+    Run-Trusted -command $command
+    Start-Sleep 1
+
+    $command = "regedit.exe /s `"$path\paint\paint.reg`""
+    Run-Trusted -command $command
+    
+    $langID = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -Name 'InstallLanguage').InstallLanguage
+    $languageMap = @{
+        '0804' = @{PAD = 'zh-CN'; Name = 'Chinese (Simplified)' }
+        '0412' = @{PAD = 'ko-KR'; Name = 'Korean' }
+        '0404' = @{PAD = 'zh-TW'; Name = 'Chinese (Traditional)' }
+        '0422' = @{PAD = 'uk-UA'; Name = 'Ukrainian' }
+        '041f' = @{PAD = 'tr-TR'; Name = 'Turkish' }
+        '041e' = @{PAD = 'th-TH'; Name = 'Thai' }
+        '241a' = @{PAD = 'sr-Latn-RS'; Name = 'Serbian (Latin)' }
+        '0424' = @{PAD = 'sl-SI'; Name = 'Slovenian' }
+        '041b' = @{PAD = 'sk-SK'; Name = 'Slovak' }
+        '0419' = @{PAD = 'ru-RU'; Name = 'Russian' }
+        '0418' = @{PAD = 'ro-RO'; Name = 'Romanian' }
+        '0816' = @{PAD = 'pt-PT'; Name = 'Portuguese (Portugal)' }
+        '0416' = @{PAD = 'pt-BR'; Name = 'Portuguese (Brazil)' }
+        '0415' = @{PAD = 'pl-PL'; Name = 'Polish' }
+        '0413' = @{PAD = 'nl-NL'; Name = 'Dutch' }
+        '0414' = @{PAD = 'nb-NO'; Name = 'Norwegian' }
+        '0426' = @{PAD = 'lv-LV'; Name = 'Latvian' }
+        '0427' = @{PAD = 'lt-LT'; Name = 'Lithuanian' }
+        '0411' = @{PAD = 'ja-JP'; Name = 'Japanese' }
+        '0410' = @{PAD = 'it-IT'; Name = 'Italian' }
+        '040e' = @{PAD = 'hu-HU'; Name = 'Hungarian' }
+        '041a' = @{PAD = 'hr-HR'; Name = 'Croatian' }
+        '040d' = @{PAD = 'he-IL'; Name = 'Hebrew' }
+        '040c' = @{PAD = 'fr-FR'; Name = 'French (France)' }
+        '0c0c' = @{PAD = 'fr-CA'; Name = 'French (Canada)' }
+        '040b' = @{PAD = 'fi-FI'; Name = 'Finnish' }
+        '0425' = @{PAD = 'et-EE'; Name = 'Estonian' }
+        '080a' = @{PAD = 'es-MX'; Name = 'Spanish (Mexico)' }
+        '040a' = @{PAD = 'es-ES'; Name = 'Spanish (Spain)' }
+        '0809' = @{PAD = 'en-GB'; Name = 'English (UK)' }
+        '0408' = @{PAD = 'el-GR'; Name = 'Greek' }
+        '0407' = @{PAD = 'de-DE'; Name = 'German' }
+        '0406' = @{PAD = 'da-DK'; Name = 'Danish' }
+        '0405' = @{PAD = 'cs-CZ'; Name = 'Czech' }
+        '0402' = @{PAD = 'bg-BG'; Name = 'Bulgarian' }
+        '0401' = @{PAD = 'ar-SA'; Name = 'Arabic' }
+        '041d' = @{PAD = 'sv-SE'; Name = 'Swedish' }
+    }
+
+    if ($languageMap.ContainsKey($langID)) {
+        $lang = $languageMap[$langID]
+        $pad = $lang.PAD
+    
+        # Copy language specific MUI file
+        $command = "Copy-Item -Path `"$path\paint\paint_lang_files\$pad\mspaint.exe.mui`" -Destination `"$env:SYSTEMROOT\System32\$pad\mspaint.exe.mui`" -Force"
+        Run-Trusted -command $command
+
+        Write-Status -msg "Copied $pad language file"
+    }
+   
+    
+    #create start shortcut
+    $WshShell = New-Object -comObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut('C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Paint.lnk')
+    $Shortcut.TargetPath = 'C:\Windows\System32\mspaint.exe'
+    $Shortcut.Save()
+
+}
+
+function install-snipping {
+    param(
+        [string]$path
+    )
+    # uninstall uwp
+    Get-AppxPackage '*ScreenSketch*' -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
+
+    $command = "
+    copy-item `"$path\snipping\SnippingTool.exe`" -Destination `"$env:systemroot\system32\SnippingTool.exe`" -Force
+    copy-item `"$path\snipping\SnippingTool.exe.mui`" -Destination `"$env:systemroot\System32\en-US\SnippingTool.exe.mui`" -Force
+"
+    Run-Trusted -command $command
+    Start-Sleep 1
+
+    $langID = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\Language' -Name 'InstallLanguage').InstallLanguage
+    $languageMap = @{
+        '0804' = @{PAD = 'zh-CN'; Name = 'Chinese (Simplified)' }
+        '0412' = @{PAD = 'ko-KR'; Name = 'Korean' }
+        '0404' = @{PAD = 'zh-TW'; Name = 'Chinese (Traditional)' }
+        '0422' = @{PAD = 'uk-UA'; Name = 'Ukrainian' }
+        '041f' = @{PAD = 'tr-TR'; Name = 'Turkish' }
+        '041e' = @{PAD = 'th-TH'; Name = 'Thai' }
+        '241a' = @{PAD = 'sr-Latn-RS'; Name = 'Serbian (Latin)' }
+        '0424' = @{PAD = 'sl-SI'; Name = 'Slovenian' }
+        '041b' = @{PAD = 'sk-SK'; Name = 'Slovak' }
+        '0419' = @{PAD = 'ru-RU'; Name = 'Russian' }
+        '0418' = @{PAD = 'ro-RO'; Name = 'Romanian' }
+        '0816' = @{PAD = 'pt-PT'; Name = 'Portuguese (Portugal)' }
+        '0416' = @{PAD = 'pt-BR'; Name = 'Portuguese (Brazil)' }
+        '0415' = @{PAD = 'pl-PL'; Name = 'Polish' }
+        '0413' = @{PAD = 'nl-NL'; Name = 'Dutch' }
+        '0414' = @{PAD = 'nb-NO'; Name = 'Norwegian' }
+        '0426' = @{PAD = 'lv-LV'; Name = 'Latvian' }
+        '0427' = @{PAD = 'lt-LT'; Name = 'Lithuanian' }
+        '0411' = @{PAD = 'ja-JP'; Name = 'Japanese' }
+        '0410' = @{PAD = 'it-IT'; Name = 'Italian' }
+        '040e' = @{PAD = 'hu-HU'; Name = 'Hungarian' }
+        '041a' = @{PAD = 'hr-HR'; Name = 'Croatian' }
+        '040d' = @{PAD = 'he-IL'; Name = 'Hebrew' }
+        '040c' = @{PAD = 'fr-FR'; Name = 'French (France)' }
+        '0c0c' = @{PAD = 'fr-CA'; Name = 'French (Canada)' }
+        '040b' = @{PAD = 'fi-FI'; Name = 'Finnish' }
+        '0425' = @{PAD = 'et-EE'; Name = 'Estonian' }
+        '080a' = @{PAD = 'es-MX'; Name = 'Spanish (Mexico)' }
+        '040a' = @{PAD = 'es-ES'; Name = 'Spanish (Spain)' }
+        '0809' = @{PAD = 'en-GB'; Name = 'English (UK)' }
+        '0408' = @{PAD = 'el-GR'; Name = 'Greek' }
+        '0407' = @{PAD = 'de-DE'; Name = 'German' }
+        '0406' = @{PAD = 'da-DK'; Name = 'Danish' }
+        '0405' = @{PAD = 'cs-CZ'; Name = 'Czech' }
+        '0402' = @{PAD = 'bg-BG'; Name = 'Bulgarian' }
+        '0401' = @{PAD = 'ar-SA'; Name = 'Arabic' }
+        '041d' = @{PAD = 'sv-SE'; Name = 'Swedish' }
+    }
+
+    if ($languageMap.ContainsKey($langID)) {
+        $lang = $languageMap[$langID]
+        $pad = $lang.PAD
+    
+        # Copy language specific MUI file
+        $command = "Copy-Item -Path `"$path\snipping\snipping_lang_files\$pad\SnippingTool.exe.mui`" -Destination `"$env:SYSTEMROOT\System32\$pad\SnippingTool.exe.mui`" -Force"
+        Run-Trusted -command $command
+
+        Write-Status -msg "Copied $pad language file"
+    
+    }
+   
+
+    $WshShell = New-Object -comObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut('C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Accessories\SnippingTool.lnk')
+    $Shortcut.TargetPath = ('C:\Windows\System32\SnippingTool.exe')
+    $Shortcut.Save()
+
+}
+
+
+function install-notepad {
+
+    #uninstall new notepad 
+    taskkill.exe /im notepad.exe /f *>$null
+    taskkill.exe /im dllhost.exe /f *>$null
+    get-appxpackage '*notepad*' | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+    #enable win10 notepad
+    Add-WindowsCapability -Online -Name Microsoft.Windows.Notepad.System~~~~0.0.1.0 -LimitAccess | Out-Null
+    # fix registry 
+    Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\notepad.exe' -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Classes\Applications\notepad.exe' -Name NoOpenWith -Force -ErrorAction SilentlyContinue
+    reg.exe add 'HKLM\SOFTWARE\Classes\*\OpenWithList\notepad.exe' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.htm\OpenWithList' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.htm\OpenWithList\notepad.exe' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.inf' /ve /t REG_SZ /d 'inffile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.ini' /ve /t REG_SZ /d 'inifile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.log' /ve /t REG_SZ /d 'txtfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.ps1' /ve /t REG_SZ /d 'Microsoft.PowerShellScript.1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.psd1' /ve /t REG_SZ /d 'Microsoft.PowerShellData.1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.psm1' /ve /t REG_SZ /d 'Microsoft.PowerShellModule.1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.scp' /ve /t REG_SZ /d 'txtfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.txt' /ve /t REG_SZ /d 'txtfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.txt\ShellNew' /v 'ItemName' /t REG_EXPAND_SZ /d '@%SystemRoot%\system32\notepad.exe,-470' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.txt\ShellNew' /v 'NullFile' /t REG_SZ /d ' ' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\.wtx' /ve /t REG_SZ /d 'txtfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Applications\notepad.exe' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Applications\notepad.exe\shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Applications\notepad.exe\shell\edit' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Applications\notepad.exe\shell\edit\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Applications\notepad.exe\shell\open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Applications\notepad.exe\shell\open\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile' /ve /t REG_SZ /d 'Setup Information' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile' /v 'FriendlyTypeName' /t REG_EXPAND_SZ /d '@%SystemRoot%\System32\setupapi.dll,-2000' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile\DefaultIcon' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\System32\imageres.dll,-69' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile\shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile\shell\open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile\shell\open\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile\shell\print' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inffile\shell\print\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE /p %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile' /ve /t REG_SZ /d 'Configuration Settings' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile' /v 'EditFlags' /t REG_DWORD /d 0x00200000 /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile' /v 'FriendlyTypeName' /t REG_SZ /d '@shell32.dll,-10151' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile\DefaultIcon' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\imageres.dll,-69' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile\shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile\shell\open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile\shell\open\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile\shell\print' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\inifile\shell\print\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE /p %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellData.1' /v 'EditFlags' /t REG_DWORD /d 0x00020000 /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellData.1' /v 'FriendlyTypeName' /t REG_EXPAND_SZ /d "@\`"%systemroot%\system32\windowspowershell\v1.0\powershell.exe\`",-104" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellData.1\Shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellData.1\Shell\Open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellData.1\Shell\Open\Command' /ve /t REG_SZ /d "\`"C:\Windows\System32\notepad.exe\`" \`"%1\`"" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellModule.1' /v 'EditFlags' /t REG_DWORD /d 0x00020000 /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellModule.1' /v 'FriendlyTypeName' /t REG_EXPAND_SZ /d "@\`"%systemroot%\system32\windowspowershell\v1.0\powershell.exe\`",-106" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellModule.1\Shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellModule.1\Shell\Open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellModule.1\Shell\Open\Command' /ve /t REG_SZ /d "\`"C:\Windows\System32\notepad.exe\`" \`"%1\`"" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellScript.1' /v 'EditFlags' /t REG_DWORD /d 0x00020000 /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellScript.1' /v 'FriendlyTypeName' /t REG_EXPAND_SZ /d "@\`"%systemroot%\system32\windowspowershell\v1.0\powershell.exe\`",-103" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellScript.1\DefaultIcon' /ve /t REG_SZ /d "\`"C:\Windows\System32\WindowsPowerShell\v1.0\powershell_ise.exe\`",1" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellScript.1\Shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellScript.1\Shell\Open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\Microsoft.PowerShellScript.1\Shell\Open\Command' /ve /t REG_SZ /d "\`"C:\Windows\System32\notepad.exe\`" \`"%1\`"" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\OpenWithList' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\OpenWithList\Notepad.exe' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\shell\edit' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\shell\edit\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\shell\open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\SystemFileAssociations\text\shell\open\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile' /ve /t REG_SZ /d 'Text Document' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile' /v 'EditFlags' /t REG_DWORD /d 0x00210000 /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile' /v 'FriendlyTypeName' /t REG_EXPAND_SZ /d '@%SystemRoot%\system32\notepad.exe,-469' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\DefaultIcon' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\imageres.dll,-102' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell\open' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell\open\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell\print' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell\print\command' /ve /t REG_EXPAND_SZ /d '%SystemRoot%\system32\NOTEPAD.EXE /p %1' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell\printto' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Classes\txtfile\shell\printto\command' /ve /t REG_EXPAND_SZ /d "%SystemRoot%\system32\notepad.exe /pt \`"%1\`" \`"%2\`" \`"%3\`" \`"%4\`"" /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities' /v 'ApplicationDescription' /t REG_EXPAND_SZ /d '@%SystemRoot%\system32\NOTEPAD.EXE,-9' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities' /v 'ApplicationName' /t REG_EXPAND_SZ /d '@%SystemRoot%\system32\NOTEPAD.EXE,-9' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities\FileAssociations' /v '.ini' /t REG_SZ /d 'inifile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities\FileAssociations' /v '.log' /t REG_SZ /d 'logfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities\FileAssociations' /v '.scp' /t REG_SZ /d 'scpfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities\FileAssociations' /v '.txt' /t REG_SZ /d 'txtfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\Microsoft\Windows\Notepad\Capabilities\FileAssociations' /v '.wtx' /t REG_SZ /d 'wtxfile' /f >$null
+    reg.exe add 'HKLM\SOFTWARE\RegisteredApplications' /v 'Notepad' /t REG_SZ /d 'Software\Microsoft\Windows\Notepad\Capabilities' /f >$null
+    reg.exe add 'HKCU\Software\Microsoft\Notepad' /v 'ShowStoreBanner' /t REG_DWORD /d 0x00000000 /f >$null
+
+    #create start shortcut
+    $WshShell = New-Object -comObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut('C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Notepad.lnk')
+    $Shortcut.TargetPath = 'C:\Windows\System32\Notepad.exe'
+    $Shortcut.Save()
+
+}
+
+function install-photoslegacy {
+
+    $appx = Get-AppxPackage -AllUsers | Where-Object { $_.PackageFullName -like '*PhotosLegacy*' }
+
+    if (!$appx) {
+        
+        Remove-Item "$($tempDir)Microsoft.PhotosLegacy_8wekyb3d8bbwe*" -Force -Recurse -ErrorAction SilentlyContinue
+        $downloadedfiles = Download-AppxPackage -PackageFamilyName 'Microsoft.PhotosLegacy_8wekyb3d8bbwe' -outputDir "$tempDir"
+        $package = $downloadedfiles | Where-Object { $_ -match '\.appxbundle$' } | Select-Object -First 1
+        $dependencies = $downloadedfiles | Where-Object { $_ -match '\.appx$' } 
+        if ($package) {
+            try {
+                Add-AppPackage $package -DependencyPath $dependencies -ForceApplicationShutdown
+            }
+            catch {
+                Write-status -msg "Can't install PhotosLegacy via appxbundle... make sure you have the appx service enabled" -errorOutput
+            }
+                
+        }
+        else {
+            Write-status -msg "Can't find PhotosLegacy Installer" -errorOutput
+        }
+    }
+}
+
+function install-classicapps {
+    param(
+        [ValidateSet('photoviewer', 'mspaint', 'snippingtool', 'notepad', 'photoslegacy')]
+        [array]$app
+    )
+
+    #check if files are downloaded locally
+    if (Test-Path "$PSScriptroot\ClassicApps") {
+        Write-Status -msg 'Classic Apps Files Found Locally'
+        $classicApps = "$PSScriptroot\ClassicApps"
+    }
+    else {
+        #check if they are already downloaded if not download them
+        
+        if (!(Test-Path "$($tempDir)ClassicApps")) {
+            $ProgressPreference = 'SilentlyContinue'
+            Write-Status -msg 'Downloading Classic Apps Files from Github...'
+            $url = 'https://github.com/zoicware/RemoveWindowsAI/archive/refs/heads/main.zip'
+            try {
+                Invoke-WebRequest -Uri $url -OutFile "$($tempDir)main.zip" -ErrorAction Stop
+            }
+            catch {
+                Write-Status -msg 'Unable to Download Github Repo' -errorOutput 
+                return
+            }
+            Expand-Archive -Path "$($tempDir)main.zip" -DestinationPath "$tempDir" -Force
+            $sourceDir = "$($tempDir)RemoveWindowsAI-main\ClassicApps"
+            $destDir = "$($tempDir)ClassicApps"
+            Copy-Item -Path $sourceDir -Destination $destDir -Recurse -Force
+            Remove-Item "$($tempDir)RemoveWindowsAI-main" -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item "$($tempDir)main.zip" -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $classicApps = "$($tempDir)ClassicApps"
+    }
+
+
+    switch ($app) {
+        'photoviewer' {  
+            Write-Status -msg 'Installing Classic Photo Viewer...'
+            install-photoviewer
+        }
+        'mspaint' {
+            Write-Status -msg 'Installing Classic Paint...'
+            install-paint -path $classicApps
+        }
+        'snippingtool' {
+            Write-Status -msg 'Installing Classic Snipping Tool...'
+            install-snipping -path $classicApps
+        }
+        'notepad' {
+            Write-Status -msg 'Installing Classic Notepad...'
+            install-notepad
+        }
+        'photoslegacy' {
+            Write-Status -msg 'Installing Photos Legacy...'
+            install-photoslegacy
+        }
+        Default {
+            Write-Status -msg 'Unknown Classic App Option' -errorOutput
+        }
+    }
+}
+
 
 if ($nonInteractive) {
+    if ($backup) {
+        Create-RestorePoint -nonInteractive
+    }
     if ($AllOptions) {
         Disable-Registry-Keys 
         Install-NOAIPackage
@@ -2220,6 +2759,12 @@ if ($nonInteractive) {
             'HideAIComponents' { Hide-AI-Components }
             'DisableRewrite' { Disable-Notepad-Rewrite }
             'RemoveRecallTasks' { Remove-Recall-Tasks }
+        }
+    }
+
+    if ($InstallClassicApps) {
+        foreach ($app in $InstallClassicApps) {
+            install-classicapps -app $app
         }
     }
 }
@@ -2263,9 +2808,8 @@ else {
     $contentRow.Height = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
     $mainGrid.RowDefinitions.Add($contentRow) | Out-Null
 
-    # Add this BEFORE your bottom row definition:
     $toggleRow = New-Object System.Windows.Controls.RowDefinition
-    $toggleRow.Height = [System.Windows.GridLength]::new(130)  # Fixed height for toggle
+    $toggleRow.Height = [System.Windows.GridLength]::new(130) 
     $mainGrid.RowDefinitions.Add($toggleRow) | Out-Null
 
     $bottomRow = New-Object System.Windows.Controls.RowDefinition
@@ -2289,6 +2833,78 @@ else {
     $scrollViewer.Margin = '20,10,20,10'
     [System.Windows.Controls.Grid]::SetRow($scrollViewer, 1)
     $mainGrid.Children.Add($scrollViewer) | Out-Null
+
+    $scrollViewerStyle = @'
+<Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" 
+       xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+       TargetType="{x:Type ScrollViewer}">
+    <Setter Property="Template">
+        <Setter.Value>
+            <ControlTemplate TargetType="{x:Type ScrollViewer}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <ScrollContentPresenter Grid.Column="0" Margin="0,0,15,0"/>
+                    <ScrollBar Grid.Column="1" 
+                               Name="PART_VerticalScrollBar"
+                               Value="{TemplateBinding VerticalOffset}"
+                               Maximum="{TemplateBinding ScrollableHeight}"
+                               ViewportSize="{TemplateBinding ViewportHeight}"
+                               Visibility="{TemplateBinding ComputedVerticalScrollBarVisibility}"
+                               Width="12"
+                               Margin="3,0,8,0">
+                        <ScrollBar.Style>
+                            <Style TargetType="ScrollBar">
+                                <Setter Property="Background" Value="#2B2B2B"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ScrollBar">
+                                            <Grid>
+                                                <Border Background="{TemplateBinding Background}" CornerRadius="6"/>
+                                                <Track Name="PART_Track" IsDirectionReversed="True">
+                                                    <Track.Thumb>
+                                                        <Thumb>
+                                                            <Thumb.Style>
+                                                                <Style TargetType="Thumb">
+                                                                    <Setter Property="Background" Value="#5A5A5A"/>
+                                                                    <Setter Property="Template">
+                                                                        <Setter.Value>
+                                                                            <ControlTemplate TargetType="Thumb">
+                                                                                <Border Background="{TemplateBinding Background}" 
+                                                                                        CornerRadius="6"
+                                                                                        Margin="2"/>
+                                                                            </ControlTemplate>
+                                                                        </Setter.Value>
+                                                                    </Setter>
+                                                                    <Style.Triggers>
+                                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                                            <Setter Property="Background" Value="#7A7A7A"/>
+                                                                        </Trigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </Thumb.Style>
+                                                        </Thumb>
+                                                    </Track.Thumb>
+                                                </Track>
+                                            </Grid>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </ScrollBar.Style>
+                    </ScrollBar>
+                </Grid>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
+</Style>
+'@
+
+    $reader = New-Object System.Xml.XmlNodeReader([xml]$scrollViewerStyle)
+    $scrollViewer.Style = [Windows.Markup.XamlReader]::Load($reader)
+
 
     $stackPanel = New-Object System.Windows.Controls.StackPanel
     $stackPanel.Orientation = 'Vertical'
@@ -2492,7 +3108,98 @@ else {
         return $toggleButton
     }
     
-     
+    $divider = New-Object System.Windows.Controls.Separator
+    $divider.Margin = '0,10,0,10'
+    $divider.Background = [System.Windows.Media.Brushes]::DarkGray
+    $stackPanel.Children.Add($divider) | Out-Null
+
+    $classicAppsHeader = New-Object System.Windows.Controls.TextBlock
+    $classicAppsHeader.Text = 'Install Classic Windows Apps'
+    $classicAppsHeader.FontSize = 16
+    $classicAppsHeader.FontWeight = 'Bold'
+    $classicAppsHeader.Foreground = [System.Windows.Media.Brushes]::Cyan
+    $classicAppsHeader.Margin = '0,10,0,10'
+    $stackPanel.Children.Add($classicAppsHeader) | Out-Null
+
+    $classicAppsFunctions = @(
+        'Install-Classic-Photoviewer'
+        'Install-Classic-Mspaint'
+        'Install-Classic-SnippingTool'
+        'Install-Classic-Notepad'
+        'Install-Photos-Legacy'
+    )
+
+    $classicAppsDescriptions = @{
+        'Install-Classic-Photoviewer'  = 'Installs the classic Windows Photo Viewer from Windows 7/8, allowing you to view images with the traditional viewer instead of the modern Photos app.'
+        'Install-Classic-Mspaint'      = 'Installs the classic Microsoft Paint application from older Windows versions.'
+        'Install-Classic-SnippingTool' = 'Installs the classic Snipping Tool, replacing the modern Snip & Sketch app.'
+        'Install-Classic-Notepad'      = 'Installs the classic Notepad from Windows 10, replacing the modern uwp version.'
+        'Install-Photos-Legacy'        = 'Installs the legacy Windows Photos app from the Microsoft Store.'
+    }
+
+    $functionDescriptions += $classicAppsDescriptions
+    foreach ($func in $classicAppsFunctions) {
+        $optionContainer = New-Object System.Windows.Controls.DockPanel
+        $optionContainer.Margin = '0,5,0,5'
+        $optionContainer.LastChildFill = $false
+    
+        $checkbox = New-Object System.Windows.Controls.CheckBox
+        $checkbox.Content = $func.Replace('-', ' ')
+        $checkbox.FontSize = 14
+        $checkbox.Foreground = [System.Windows.Media.Brushes]::White
+        $checkbox.Margin = '0,0,10,0'
+        $checkbox.VerticalAlignment = 'Center'
+        $checkbox.IsChecked = $false  
+        [System.Windows.Controls.DockPanel]::SetDock($checkbox, 'Left')
+        $checkboxes[$func] = $checkbox
+    
+        $infoButton = New-Object System.Windows.Controls.Button
+        $infoButton.Content = '?'
+        $infoButton.Width = 25
+        $infoButton.Height = 25
+        $infoButton.FontSize = 12
+        $infoButton.FontWeight = 'Bold'
+        $infoButton.Background = [System.Windows.Media.Brushes]::DarkBlue
+        $infoButton.Foreground = [System.Windows.Media.Brushes]::White
+        $infoButton.BorderBrush = [System.Windows.Media.Brushes]::Transparent
+        $infoButton.BorderThickness = 0
+        $infoButton.VerticalAlignment = 'Center'
+        $infoButton.Cursor = 'Hand'
+        [System.Windows.Controls.DockPanel]::SetDock($infoButton, 'Right')
+    
+        $infoTemplate = @'
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+    <Border Background="{TemplateBinding Background}" 
+            BorderBrush="{TemplateBinding BorderBrush}" 
+            BorderThickness="{TemplateBinding BorderThickness}" 
+            CornerRadius="12">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+</ControlTemplate>
+'@
+        $infoButton.Template = [System.Windows.Markup.XamlReader]::Parse($infoTemplate)
+    
+        $infoButton.Add_Click({
+                param($sender, $e)
+        
+                # Find the correct function name
+                foreach ($f in $classicAppsFunctions) {
+                    if ($checkboxes[$f].Parent -eq $sender.Parent) {
+                        $funcName = $f
+                        break
+                    }
+                }
+        
+                $description = $functionDescriptions[$funcName]
+                [System.Windows.MessageBox]::Show($description, $funcName, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+            })
+    
+        $optionContainer.Children.Add($checkbox) | Out-Null
+        $optionContainer.Children.Add($infoButton) | Out-Null
+        $stackPanel.Children.Add($optionContainer) | Out-Null
+    }
+
+    $allFunctions = $functions + $classicAppsFunctions
     
     $toggleGrid = New-Object System.Windows.Controls.Grid
     [System.Windows.Controls.Grid]::SetRow($toggleGrid, 2)  
@@ -2845,7 +3552,7 @@ else {
             $progressWindow.Show()
     
             $selectedFunctions = @()
-            foreach ($func in $functions) {
+            foreach ($func in $allFunctions) {
                 if ($checkboxes[$func].IsChecked) {
                     $selectedFunctions += $func
                 }
@@ -2858,6 +3565,9 @@ else {
             }
     
             try {
+                if ($backup) {
+                    Create-RestorePoint
+                }
                 foreach ($func in $selectedFunctions) {
                     $progressText.Text = "Executing: $($func.Replace('-', ' '))"
                     $progressWindow.UpdateLayout()
@@ -2874,6 +3584,11 @@ else {
                         'Hide-AI-Components' { Hide-AI-Components }
                         'Disable-Notepad-Rewrite' { Disable-Notepad-Rewrite }
                         'Remove-Recall-Tasks' { Remove-Recall-Tasks }
+                        'Install-Classic-Photoviewer' { install-classicapps -app 'photoviewer' }
+                        'Install-Classic-Mspaint' { install-classicapps -app 'mspaint' }
+                        'Install-Classic-SnippingTool' { install-classicapps -app 'snippingtool' }
+                        'Install-Classic-Notepad' { install-classicapps -app 'notepad' }
+                        'Install-Photos-Legacy' { install-classicapps -app 'photoslegacy' }
                     }
             
                     Start-Sleep -Milliseconds 500
@@ -2888,19 +3603,19 @@ else {
                 if ($result -eq [System.Windows.MessageBoxResult]::Yes) {
                     #cleanup code
                     try {
-                        Remove-Item "$env:TEMP\aiPackageRemoval.ps1" -Force -ErrorAction SilentlyContinue
+                        Remove-Item "$($tempDir)aiPackageRemoval.ps1" -Force -ErrorAction SilentlyContinue
                     }
                     catch {}
                     try {
-                        Remove-Item "$env:TEMP\RemoveRecallTasks.ps1" -Force -ErrorAction SilentlyContinue
+                        Remove-Item "$($tempDir)RemoveRecallTasks.ps1" -Force -ErrorAction SilentlyContinue
                     }
                     catch {}
                     try {
-                        Remove-Item "$env:TEMP\PathsToDelete.txt" -Force -ErrorAction SilentlyContinue
+                        Remove-Item "$($tempDir)PathsToDelete.txt" -Force -ErrorAction SilentlyContinue
                     }
                     catch {}  
                     try {
-                        Remove-Item "$env:TEMP\ZoicwareRemoveWindowsAI-*1.0.0.0.cab" -Force -ErrorAction SilentlyContinue
+                        Remove-Item "$($tempDir)ZoicwareRemoveWindowsAI-*1.0.0.0.cab" -Force -ErrorAction SilentlyContinue
                     }
                     catch {}
 
@@ -2946,19 +3661,19 @@ else {
 
 #cleanup code
 try {
-    Remove-Item "$env:TEMP\aiPackageRemoval.ps1" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$($tempDir)aiPackageRemoval.ps1" -Force -ErrorAction SilentlyContinue
 }
 catch {}
 try {
-    Remove-Item "$env:TEMP\RemoveRecallTasks.ps1" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$($tempDir)RemoveRecallTasks.ps1" -Force -ErrorAction SilentlyContinue
 }
 catch {}
 try {
-    Remove-Item "$env:TEMP\PathsToDelete.txt" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$($tempDir)PathsToDelete.txt" -Force -ErrorAction SilentlyContinue
 }
 catch {}
 try {
-    Remove-Item "$env:TEMP\ZoicwareRemoveWindowsAI-*1.0.0.0.cab" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$($tempDir)ZoicwareRemoveWindowsAI-*1.0.0.0.cab" -Force -ErrorAction SilentlyContinue
 }
 catch {}
 
@@ -2987,3 +3702,4 @@ if (!$nonInteractive) {
 }
 
 exit
+

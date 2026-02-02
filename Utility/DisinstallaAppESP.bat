@@ -24,7 +24,7 @@ timeout /t 3 >nul
 
 echo. 
 
-start /wait powershell -ExecutionPolicy Bypass -File "%removerDir%\DesinstalaApp.ps1"
+start /wait powershell -ExecutionPolicy Bypass -File "%removerDir%\DisinstallaAppESP.ps1"
 
 timeout /t 2 >nul
 

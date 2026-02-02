@@ -21,7 +21,7 @@ set "removerDir=%~dp0Remover"
 :: =======================================
 echo Opening PowerShell in a separate window to remove Windows Store apps.
 timeout /t 3 >nul
-start /wait powershell -ExecutionPolicy Bypass -File "%removerDir%\DisinstallaApp.ps1"
+start /wait powershell -ExecutionPolicy Bypass -File "%removerDir%\DisinstallaAppENG.ps1"
 timeout /t 2 >nul
 
 :: =======================================

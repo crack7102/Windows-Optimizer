@@ -432,7 +432,6 @@ function Show-OpeningMessage($text) {
     $l.Font = New-Object System.Drawing.Font("Arial",11,[System.Drawing.FontStyle]::Bold)
     $l.AutoSize = $true
     $l.Location = "30,25"
-    $l.StartPosition = "CenterScreen"
 
     $f.Controls.Add($l)
     $f.Show()
